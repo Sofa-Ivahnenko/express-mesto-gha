@@ -1,81 +1,137 @@
+require('dotenv').config();
+const bcrypt = require('bcryptjs');
+const jwt = require('jsonwebtoken');
 const User = require('../models/user');
-const {
-  HTTP_STATUS_BAD_REQUEST_ERROR,
-  HTTP_STATUS_NOT_FOUND,
-  HTTP_STATUS_INTERNAL_SERVER_ERROR,
-  HTTP_STATUS_CREATED,
-} = require('../errors/errors');
 
-module.exports.getAllUsers = (req, res) => {
-  console.log('getAllUsers');
+const {
+  BadRequestError,
+  ConflictError,
+  NotFoundError,
+} = require('../errors/index-errors');
+
+module.exports.getAllUsers = (req, res, next) => {
   User.find({})
-    .then((users) => res.send(users))
-    .catch(() => res.status(HTTP_STATUS_INTERNAL_SERVER_ERROR)
-      .send({ message: 'Произошла ошибка на сервере' }));
+    .then((users) => res.send({ users }))
+    .catch(next);
 };
 
-module.exports.getCurrentUser = (req, res) => {
+module.exports.getCurrentUser = (req, res, next) => {
   User
-    .findById(req.params.userId)
-    .orFail()
-    .then((user) => res.status(200).send(user))
+    .findById(req.user._id)
+    .then((user) => {
+      if (!user) {
+        return next(new NotFoundError('Пользователь по указанному _id не найден'));
+      }
+      return res.send({ user });
+    })
+    .catch(next);
+};
+
+module.exports.getUserById = (req, res, next) => {
+  const { userId } = req.params;
+
+  User
+    .findById(userId)
+    .then((user) => {
+      if (!user) {
+        return next(new NotFoundError('Пользователь по указанному _id не найден'));
+      }
+      return res.send({ user });
+    })
     .catch((err) => {
       if (err.name === 'CastError') {
-        return res.status(HTTP_STATUS_BAD_REQUEST_ERROR).send({ message: 'Передан некорректный _id пользователя' });
+        next(new BadRequestError(`Переданы некорректные данные при создании пользователя -- ${err.name}`));
+      } else {
+        next(err);
       }
-      if (err.name === 'DocumentNotFoundError') {
-        return res.status(HTTP_STATUS_NOT_FOUND).send({ message: 'Пользователь с указанным _id не найден.' });
-      }
-
-      return res.status(HTTP_STATUS_INTERNAL_SERVER_ERROR).send({ message: 'Произошла ошибка' });
     });
 };
 
-module.exports.createUser = (req, res) => {
-  const { name, about, avatar } = req.body;
+// eslint-disable-next-line consistent-return
+module.exports.createUser = (req, res, next) => {
+  const {
+    name, about, avatar, email, password,
+  } = req.body;
 
-  User.create({ name, about, avatar })
-    .then((user) => res.status(HTTP_STATUS_CREATED).send(user))
+  bcrypt.hash(password, 10)
+    .then((hash) => User.create({
+      name, about, avatar, email, password: hash,
+    }))
+    .then((user) => res.send({
+      name: user.name,
+      about: user.about,
+      avatar: user.avatar,
+      email: user.email,
+      _id: user._id,
+    }))
     .catch((err) => {
-      if (err.name === 'ValidationError') {
-        return res.status(HTTP_STATUS_BAD_REQUEST_ERROR).send({ message: 'Переданы некорректные данные при создании пользователя' });
+      if (err.name === 'ValidationError' || err.name === 'CastError') {
+        next(new BadRequestError(`Переданы некорректные данные при создании пользователя -- ${err.name}`));
+      } else if (err.code === 11000) {
+        next(new ConflictError('Пользователь с таким email уже зарегистрирован'));
+      } else {
+        next(err);
       }
-      return res.status(HTTP_STATUS_INTERNAL_SERVER_ERROR).send({ message: 'На сервере произошла ошибка' });
     });
 };
 
-module.exports.updateProfile = (req, res) => {
+module.exports.login = (req, res, next) => {
+  const { email, password } = req.body;
+
+  User.findUserByCredentials(email, password)
+    .then((user) => {
+      const token = jwt.sign({ _id: user._id }, 'some-secret-key', { expiresIn: '7d' });
+      res
+        .cookie('jwt', token, {
+          maxAge: 3600000,
+          httpOnly: true,
+          sameSite: true,
+        })
+        .send({ token });
+    })
+    .catch(next);
+};
+
+module.exports.updateProfile = (req, res, next) => {
   const { name, about } = req.body;
 
   User
-    .findByIdAndUpdate(req.user._id, { name, about }, { new: true, runValidators: true })
-    .orFail()
-    .then((user) => res.send(user))
+    .findByIdAndUpdate(
+      { _id: req.user._id },
+      { name, about },
+      { new: true, runValidators: true },
+    )
+    .then((user) => {
+      if (!user) {
+        return next(new NotFoundError('Пользователь по указанному _id не найден'));
+      }
+      return res.send({ user });
+    })
     .catch((err) => {
-      if (err.name === 'CastError' || err.name === 'ValidationError') {
-        return res.status(HTTP_STATUS_BAD_REQUEST_ERROR).send({ message: 'Переданы не корректные данные при обновлении профиля' });
+      if (err.name === 'ValidationError' || err.name === 'CastError') {
+        next(new BadRequestError(`Переданы некорректные данные при обновлении профиля -- ${err.name}`));
+      } else {
+        next(err);
       }
-      if (err.name === 'DocumentNotFoundError') {
-        return res.status(HTTP_STATUS_NOT_FOUND).send({ message: 'Пользователь с указанным _id не найден.' });
-      }
-      return res.status(HTTP_STATUS_INTERNAL_SERVER_ERROR).send({ message: 'На сервере произошла ошибка' });
     });
 };
 
-module.exports.updateAvatar = (req, res) => {
+module.exports.updateAvatar = (req, res, next) => {
   const { avatar } = req.body;
 
   User
     .findByIdAndUpdate(req.user._id, { avatar }, { new: true, runValidators: true })
-    .orFail()
-    .then((user) => res.send(user))
+    .then((user) => {
+      if (!user) {
+        return next(new NotFoundError('Пользователь по указанному _id не найден'));
+      }
+      return res.send({ user });
+    })
     .catch((err) => {
-      if (err.name === 'CastError' || err.name === 'ValidationError') {
-        return res.status(HTTP_STATUS_BAD_REQUEST_ERROR).send({ message: 'Переданы некорректные данные при обновлении аватара' });
+      if (err.name === 'ValidationError' || err.name === 'CastError') {
+        next(new BadRequestError(`Переданы некорректные данные при обновлении профиля -- ${err.name}`));
+      } else {
+        next(err);
       }
-      if (err.name === 'DocumentNotFoundError') {
-        return res.status(HTTP_STATUS_NOT_FOUND).send({ message: 'Пользователь с указанным _id не найден.' });
-      }
-      return res.status(HTTP_STATUS_INTERNAL_SERVER_ERROR).send({ message: 'На сервере произошла ошибка' });
     });
 };
